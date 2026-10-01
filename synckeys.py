@@ -1,240 +1,416 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-import configparser
 import argparse
-import os
-import shutil
 import codecs
-import re
+import configparser
 from datetime import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 
-# General global variables
+WINDOWS_BT_REGISTER_PATH = r"ControlSet001\Services\BTHPORT\Parameters\Keys"
+
+
+def find_windows_mount():
+    """Auto-detect mounted Windows partition via /proc/mounts"""
+    mounts = []
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    mnt = codecs.decode(parts[1], "unicode_escape")
+                    for p in (
+                        os.path.join(
+                            mnt, "Windows", "System32", "config", "SYSTEM"
+                        ),
+                        os.path.join(
+                            mnt, "windows", "system32", "config", "system"
+                        ),
+                    ):
+                        if os.path.isfile(p) and mnt not in mounts:
+                            mounts.append(mnt)
+    except Exception:
+        pass
+    return mounts
+
+
+def export_registry(windows_root):
+    candidates = [
+        os.path.join(windows_root, "Windows", "System32", "config", "SYSTEM"),
+        os.path.join(windows_root, "windows", "system32", "config", "system"),
+    ]
+    hive_path = next((c for c in candidates if os.path.isfile(c)), None)
+    if not hive_path:
+        print(f"[-] ERROR: SYSTEM hive not found in {windows_root}")
+        sys.exit(1)
+
+    with TemporaryDirectory() as temp_dir:
+        out_reg = os.path.join(temp_dir, "exported.reg")
+        cmd = [
+            "reged",
+            "-x",
+            hive_path,
+            "HKEY_LOCAL_MACHINE\\SYSTEM",
+            WINDOWS_BT_REGISTER_PATH,
+            out_reg,
+        ]
+        res = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        if res.returncode != 0 or not os.path.isfile(out_reg):
+            print("[-] ERROR: reged failed to export registry keys.")
+            if res.stderr:
+                print(res.stderr.decode())
+            sys.exit(1)
+
+        with open(out_reg, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
+
 _prev_adapter_mac = None
 
 
-def format_hex(hex_string):
-    return hex_string.replace('hex:', '').replace(',', '').upper()
+def format_hex(s):
+    return s.replace("hex:", "").replace(",", "").upper()
 
 
-def format_hex_b(hex_string):
-    hex_parts = hex_string.replace('hex(b):', '').split(',')
-    hex_parts.reverse()
-    hex = ''.join(hex_parts)
-    return hex
-
-def format_dword(dword_string):
-    dword = dword_string.replace('dword:', '')
-    return dword
+def format_hex_b(s):
+    parts = s.replace("hex(b):", "").split(",")
+    parts.reverse()
+    return "".join(parts).upper()
 
 
-def format_mac_address(mac_string):
-    address = mac_string.upper()
-    address_parts = [address[i:i + 2] for i in range(0, len(address), 2)]
-    return ':'.join(address_parts)
+def format_dword(s):
+    return s.replace("dword:", "")
 
 
-def load_keys_from_file(file_path):
-    # Load full file contents and clean up into a config parseable format
-    with codecs.open(file_path, 'r', 'utf-16-le') as f:
-        contents = f.read()
-        contents = contents.replace('"', '').replace('=', ' = ')
-        contents = re.sub(r'HKEY_LOCAL_MACHINE\\SYSTEM\\.*?\\Services\\BTHPORT\\Parameters\\Keys\\', '', contents).split('\r\n')
+def format_mac(s):
+    s = s.upper()
+    return ":".join(s[i : i + 2] for i in range(0, len(s), 2))
 
-        del contents[0:4]
-        config_contents = '\n'.join(contents)
 
-        # Parse the contents into a configuration structure
-        parsed_config = configparser.ConfigParser()
-        parsed_config.read_string(config_contents)
-        return parsed_config
+def is_mac_address(name):
+    return re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", name) is not None
+
+
+def get_adapter_path(adapter_mac):
+    return f"/var/lib/bluetooth/{adapter_mac}"
 
 
 def get_device_path(adapter_mac, device_mac):
-    return f'/var/lib/bluetooth/{adapter_mac}/{device_mac}'
-
-
-def backup_device_info_file(adapter_mac, device_mac):
-    device_path = get_device_path(adapter_mac, device_mac)
-    now = datetime.now()
-    current_datetime = now.strftime("%Y%m%d%H%M%S")
-    shutil.copyfile(f'{device_path}/info', f'{device_path}/info-{current_datetime}')
+    return f"/var/lib/bluetooth/{adapter_mac}/{device_mac}"
 
 
 def get_device_pairing_info(adapter_mac, device_mac):
-    device_path = get_device_path(adapter_mac, device_mac)
-    info_file = f'{device_path}/info'
-
+    info_file = f"{get_device_path(adapter_mac, device_mac)}/info"
     if not os.path.isfile(info_file):
         return None
+    cfg = configparser.ConfigParser()
+    cfg.optionxform = str
+    cfg.read(info_file)
+    return cfg
 
-    # Read info data into a config structure
-    pairing_config = configparser.ConfigParser()
-    pairing_config.optionxform = str
-    pairing_config.read(info_file)
-    return pairing_config
+
+def backup_device_info_file(adapter_mac, device_mac):
+    path = get_device_path(adapter_mac, device_mac)
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    shutil.copyfile(f"{path}/info", f"{path}/info-{ts}")
 
 
 def update_system_pairing(adapter_mac, device_mac, config):
     backup_device_info_file(adapter_mac, device_mac)
-    # Write config structure back to info file
-    device_path = get_device_path(adapter_mac, device_mac)
-    info_file = open(f'{device_path}/info', 'w')
-    config.write(info_file)
-    info_file.close()
+    with open(
+        f"{get_device_path(adapter_mac, device_mac)}/info", "w"
+    ) as info_file:
+        config.write(info_file)
 
 
 def print_device_info(device_config, device_mac):
     if not device_config:
-        print(f'  {device_mac} (# not paired #)')
+        print(f"  {device_mac} (# not paired in Linux #)")
         return
-
-    # Get paired device name
-    device_name = device_config['General']['Name']
-    device_alias = device_config['General'].get('Alias', device_name)
-    print(f'\n  {device_mac} ({device_name} / {device_alias})')
+    name = device_config.get("General", "Name", fallback="Unknown")
+    alias = device_config.get("General", "Alias", fallback=name)
+    print(f"\n  {device_mac} ({name} / {alias})")
 
 
 def print_update_values(name, current_value, new_value):
-    change_required = False
-
     if current_value == new_value:
-        print(f'    | {name}: {current_value} > No change required.')
-    else:
-        print(f'    | {name}: {current_value} > Update to: {new_value}')
-        change_required = True
+        print(f"    | {name}: {current_value} > No change required.")
+        return False
+    print(f"    | {name}: {current_value} > Update to: {new_value}")
+    return True
 
-    return change_required
+
+def find_le_clone_candidates(adapter_mac, dump_macs):
+    adapter_path = get_adapter_path(adapter_mac)
+    candidates = []
+    if not os.path.isdir(adapter_path):
+        return candidates
+    for name in sorted(os.listdir(adapter_path)):
+        if not is_mac_address(name) or name in dump_macs:
+            continue
+        cfg = get_device_pairing_info(adapter_mac, name)
+        if not cfg or "General" not in cfg:
+            continue
+        if "LE" not in cfg["General"].get("SupportedTechnologies", ""):
+            continue
+        candidates.append((name, cfg))
+    return candidates
+
+
+def clone_le_device(adapter_config, adapter_mac, device_mac, dump_macs):
+    candidates = find_le_clone_candidates(adapter_mac, dump_macs)
+    if not candidates:
+        return None
+    windows_irk = (
+        format_hex(adapter_config["IRK"]) if "IRK" in adapter_config else None
+    )
+    suggested = None
+    print("    | Linux-paired LE devices not present in Windows:")
+    for idx, (mac, cfg) in enumerate(candidates, start=1):
+        name = cfg["General"].get("Name", "?")
+        marker = ""
+        if (
+            windows_irk
+            and "IdentityResolvingKey" in cfg
+            and cfg["IdentityResolvingKey"].get("Key", "").upper()
+            == windows_irk
+        ):
+            marker = " (IRK matches!)"
+            suggested = idx
+        print(f"    |   {idx}) {mac} ({name}){marker}")
+
+    default = str(suggested) if suggested else "N"
+    action = input(
+        f"    > Copy one of these pairings to {device_mac}? (number/y/N) [{default}]: "
+    ).strip()
+
+    if not action:
+        action = default
+    # Handle user typing 'y' or 'yes'
+    if action.lower() in ("y", "yes"):
+        action = str(suggested) if suggested else "1"
+
+    if not action.isdigit() or not 1 <= int(action) <= len(candidates):
+        return None
+
+    src_mac = candidates[int(action) - 1][0]
+    src_path = get_device_path(adapter_mac, src_mac)
+    dst_path = get_device_path(adapter_mac, device_mac)
+    shutil.copytree(src_path, dst_path)
+
+    cache_src = f"{get_adapter_path(adapter_mac)}/cache/{src_mac}"
+    if os.path.isfile(cache_src):
+        shutil.copyfile(
+            cache_src, f"{get_adapter_path(adapter_mac)}/cache/{device_mac}"
+        )
+
+    paired_cfg = get_device_pairing_info(adapter_mac, device_mac)
+    if "AddressType" in adapter_config and "General" in paired_cfg:
+        addr_type = (
+            "static"
+            if int(format_dword(adapter_config["AddressType"]), 16) == 1
+            else "public"
+        )
+        paired_cfg["General"]["AddressType"] = addr_type
+        with open(f"{dst_path}/info", "w") as f:
+            paired_cfg.write(f)
+    print(f"    > Copied {src_mac} -> {device_mac}. Original pairing preserved.")
+    return get_device_pairing_info(adapter_mac, device_mac)
 
 
 def process_basic_pairing(adapter_config, adapter_mac):
-    # Iterate through each device and pairing key from the dumped registry config
-    for device, pairing_key in adapter_config.items():
-        if device == 'masterirk':
+    for device, key_val in adapter_config.items():
+        if device in ("masterirk", "centralirk"):
+            continue
+        dev_mac = format_mac(device)
+        pairing_key = format_hex(key_val)
+
+        paired_cfg = get_device_pairing_info(adapter_mac, dev_mac)
+        print_device_info(paired_cfg, dev_mac)
+        if not paired_cfg:
             continue
 
-        device_mac = format_mac_address(device)
-        pairing_key = format_hex(pairing_key)
-
-        # Check this adapter's paired devices in the current Linux system
-        paired_config = get_device_pairing_info(adapter_mac, device_mac)
-        print_device_info(paired_config, device_mac)
-
-        if not paired_config:
+        cur_key = paired_cfg.get("LinkKey", "Key", fallback=None)
+        if not print_update_values("LinkKey", cur_key, pairing_key):
             continue
 
-        current_key = paired_config['LinkKey']['Key']
-        # preemptively replace system key
-        paired_config['LinkKey']['Key'] = pairing_key
-
-        if not print_update_values('LinkKey', current_key, pairing_key):
-            continue
-
-        action = input(f'    > Update keys for device? (y/N): ')
-        if action.lower() == 'y':
-            update_system_pairing(adapter_mac, device_mac, paired_config)
-            print(f'    > OK!')
+        if (
+            input("    > Update keys for device? (y/N): ").strip().lower()
+            == "y"
+        ):
+            paired_cfg["LinkKey"]["Key"] = pairing_key
+            update_system_pairing(adapter_mac, dev_mac, paired_cfg)
+            print("    > OK!")
 
 
-def process_advanced_pairing(adapter_config, adapter_mac, device_mac):
-    # Check this adapter's paired devices in the current Linux system
-    paired_config = get_device_pairing_info(adapter_mac, device_mac)
-    print_device_info(paired_config, device_mac)
+def process_advanced_pairing(
+    adapter_config, adapter_mac, device_mac, dump_macs
+):
+    paired_cfg = get_device_pairing_info(adapter_mac, device_mac)
+    print_device_info(paired_cfg, device_mac)
+
+    if not paired_cfg:
+        paired_cfg = clone_le_device(
+            adapter_config, adapter_mac, device_mac, dump_macs
+        )
+        if not paired_cfg:
+            return
+
     require_update = False
 
-    if not paired_config:
-        return
+    if "IRK" in adapter_config and "IdentityResolvingKey" in paired_cfg:
+        irk = format_hex(adapter_config["IRK"])
+        cur_irk = paired_cfg["IdentityResolvingKey"].get("Key", "")
+        if print_update_values("IdentityResolvingKey", cur_irk, irk):
+            paired_cfg["IdentityResolvingKey"]["Key"] = irk
+            require_update = True
 
-    if 'IRK' in adapter_config:
-        irk = format_hex(adapter_config['IRK'])
-        current_irk = paired_config['IdentityResolvingKey']['Key']
-        # preemptively setting the final value in the config, but not persisting
-        paired_config['IdentityResolvingKey']['Key'] = irk
-        require_update |= print_update_values('IdentityResolvingKey', current_irk, irk)
+    if "CSRK" in adapter_config and "LocalSignatureKey" in paired_cfg:
+        csrk = format_hex(adapter_config["CSRK"])
+        cur_csrk = paired_cfg["LocalSignatureKey"].get("Key", "")
+        if print_update_values("LocalSignatureKey", cur_csrk, csrk):
+            paired_cfg["LocalSignatureKey"]["Key"] = csrk
+            require_update = True
 
-    if 'CSRK' in adapter_config:
-        csrk = format_hex(adapter_config['CSRK'])
-        current_csrk = paired_config['LocalSignatureKey']['Key']
-        # preemptively setting the final value in the config, but not persisting
-        paired_config['LocalSignatureKey']['Key'] = csrk
-        require_update |= print_update_values('LocalSignatureKey', current_csrk, csrk)
+    if "LTK" in adapter_config:
+        ltk = format_hex(adapter_config["LTK"])
+        for s in ("LongTermKey", "SlaveLongTermKey", "PeripheralLongTermKey"):
+            if s in paired_cfg:
+                cur_ltk = paired_cfg[s].get("Key", "")
+                if print_update_values(s, cur_ltk, ltk):
+                    paired_cfg[s]["Key"] = ltk
+                    require_update = True
 
-    if 'LTK' in adapter_config:
-        ltk = format_hex(adapter_config['LTK'])
-        current_ltk = paired_config['LongTermKey']['Key']
-        # preemptively setting the final value in the config, but not persisting
-        paired_config['LongTermKey']['Key'] = ltk
-        require_update |= print_update_values('LongTermKey', ltk, current_ltk)
+    if "KeyLength" in adapter_config:
+        key_len = str(int(format_dword(adapter_config["KeyLength"]), 16))
+        for s in ("LongTermKey", "SlaveLongTermKey", "PeripheralLongTermKey"):
+            if s in paired_cfg:
+                cur_len = paired_cfg[s].get("EncSize", "")
+                if print_update_values("  EncSize", cur_len, key_len):
+                    paired_cfg[s]["EncSize"] = key_len
+                    require_update = True
 
-    if 'KeyLength' in adapter_config:
-        ltk_key_length = str(int(format_dword(adapter_config['KeyLength']), 16))
-        current_ltk_key_length = paired_config['LongTermKey']['EncSize']
-        # preemptively setting the final value in the config, but not persisting
-        paired_config['LongTermKey']['EncSize'] = ltk_key_length
-        require_update |= print_update_values('  EncSize', ltk_key_length, current_ltk_key_length)
+    if "EDIV" in adapter_config:
+        ediv = str(int(format_dword(adapter_config["EDIV"]), 16))
+        for s in ("LongTermKey", "SlaveLongTermKey", "PeripheralLongTermKey"):
+            if s in paired_cfg:
+                cur_ediv = paired_cfg[s].get("EDiv", "")
+                if print_update_values("  EDiv", cur_ediv, ediv):
+                    paired_cfg[s]["EDiv"] = ediv
+                    require_update = True
 
-    if 'EDIV' in adapter_config:
-        ltk_ediv = str(int(format_dword(adapter_config['EDIV']), 16))
-        current_ltk_ediv = paired_config['LongTermKey']['EDiv']
-        # preemptively setting the final value in the config, but not persisting
-        paired_config['LongTermKey']['EDiv'] = ltk_ediv
-        require_update |= print_update_values('  EDiv', ltk_ediv, current_ltk_ediv)
-
-    if 'ERand' in adapter_config:
-        ltk_erand = str(int(format_hex_b(adapter_config['ERand']), 16))
-        current_ltk_erand = paired_config['LongTermKey']['Rand']
-        # preemptively setting the final value in the config, but not persisting
-        paired_config['LongTermKey']['Rand'] = ltk_erand
-        require_update |= print_update_values('  Rand', ltk_erand, current_ltk_erand)
+    if "ERand" in adapter_config:
+        rand = str(int(format_hex_b(adapter_config["ERand"]), 16))
+        for s in ("LongTermKey", "SlaveLongTermKey", "PeripheralLongTermKey"):
+            if s in paired_cfg:
+                cur_rand = paired_cfg[s].get("Rand", "")
+                if print_update_values("  Rand", cur_rand, rand):
+                    paired_cfg[s]["Rand"] = rand
+                    require_update = True
 
     if not require_update:
         return
 
-    action = input(f'    > Update keys for device? (y/N): ')
-    if action.lower() == 'y':
-        update_system_pairing(adapter_mac, device_mac, paired_config)
-        print(f'    > OK!')
+    if input("    > Update keys for device? (y/N): ").strip().lower() == "y":
+        update_system_pairing(adapter_mac, device_mac, paired_cfg)
+        print("    > OK!")
 
 
-def print_adapter_mac(current_adapter_mac):
-    global _prev_adapter_mac
-    # Only print the adapter mac information if we are starting for the first time or when we change adapter group of devices.
-    # Will work only if we sort device and adapter\device pairs first such that they are grouped together.
-    if _prev_adapter_mac != current_adapter_mac:
-        if _prev_adapter_mac != None:
-            print()
-        print(f'Bluetooth Adapter - {current_adapter_mac}')
-    _prev_adapter_mac = current_adapter_mac
+def load_keys(contents):
+    contents = contents.replace('"', "").replace("=", " = ")
+    contents = re.sub(
+        r"HKEY_LOCAL_MACHINE\\SYSTEM\\.*?\\Services\\BTHPORT\\Parameters\\Keys\\?",
+        "",
+        contents,
+    )
+    lines = contents.replace("\r\n", "\n").split("\n")
+    cleaned = [
+        line
+        for line in lines
+        if line.strip() != "[]"
+        and not line.startswith("Windows Registry Editor")
+        and not line.startswith(";")
+    ]
+
+    cfg = configparser.ConfigParser()
+    cfg.read_string("\n".join(cleaned))
+    return cfg
 
 
 def process_devices(config):
-    # Sort the list of adapters and adapter\device pairs to make sequential grouping by adapter and parsing easier
-    adapter_devices = sorted(config.sections())
-    for device in adapter_devices:
-        if not '\\' in device:
-            adapter_mac = format_mac_address(device)
-            print_adapter_mac(adapter_mac)
-            # Launch basic pairing extraction and update
-            process_basic_pairing(config[device], adapter_mac)
+    sections = sorted(config.sections())
+    dump_macs = set()
+    for sec in sections:
+        if "\\" in sec:
+            dump_macs.add(format_mac(sec.split("\\")[1]))
         else:
-            mac_addresses = device.split('\\')
-            adapter_mac = format_mac_address(mac_addresses[0])
-            device_mac = format_mac_address(mac_addresses[1])
-            print_adapter_mac(adapter_mac)
-            # Launch advanced pairing extraction and update
-            process_advanced_pairing(config[device], adapter_mac, device_mac)
+            for k in config[sec]:
+                if k not in ("masterirk", "centralirk"):
+                    dump_macs.add(format_mac(k))
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="SyncKeys - Update Linux Bluetooth keys from Windows-paired devices")
-    parser.add_argument('keyfile', help='Path to exported Windows Registry (.reg) file.')
-    return parser.parse_args()
+    for sec in sections:
+        if "\\" not in sec:
+            adapter_mac = format_mac(sec)
+            print(f"\nBluetooth Adapter - {adapter_mac}")
+            process_basic_pairing(config[sec], adapter_mac)
+        else:
+            ad_mac, dev_mac = (format_mac(x) for x in sec.split("\\"))
+            print(f"\nBluetooth Adapter - {ad_mac}")
+            process_advanced_pairing(
+                config[sec], ad_mac, dev_mac, dump_macs
+            )
 
 
 def main():
-    args = parse_args()
-    config = load_keys_from_file(args.keyfile)
-    process_devices(config)
+    if os.geteuid() != 0:
+        print("[-] Must run with sudo.")
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(
+        description="Sync Bluetooth Keys from Windows to Linux"
+    )
+    parser.add_argument(
+        "-w",
+        "--windows-dir",
+        help="Path to Windows mount root (auto-detected if omitted)",
+    )
+    parser.add_argument("-r", "--reg-file", help="Path to exported .reg file")
+    args = parser.parse_args()
+
+    content = None
+    if args.reg_file:
+        with codecs.open(
+            args.reg_file, "r", encoding="utf-16-le", errors="ignore"
+        ) as f:
+            content = f.read()
+    elif args.windows_dir:
+        content = export_registry(args.windows_dir)
+    else:
+        # Auto-detect Windows mount
+        found = find_windows_mount()
+        if len(found) == 1:
+            print(f"[*] Auto-detected Windows at: {found[0]}")
+            content = export_registry(found[0])
+        elif len(found) > 1:
+            print(f"[-] Multiple Windows mounts found: {found}")
+            print("    Please specify which one using -w <path>")
+            sys.exit(1)
+        else:
+            print(
+                "[-] Could not auto-detect Windows. Ensure it is mounted or specify with -w <path>"
+            )
+            sys.exit(1)
+
+    cfg = load_keys(content)
+    process_devices(cfg)
+    print("\n[+] Done! Run: sudo systemctl restart bluetooth")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
